@@ -1,0 +1,23 @@
+{
+  "name": "webaudit",
+  "version": "1.0.0",
+  "description": "CLI website auditor — crawl, extract SEO metadata, detect broken links",
+  "type": "module",
+  "bin": {
+    "webaudit": "./bin/webaudit.js"
+  },
+  "scripts": {
+    "start": "node bin/webaudit.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "cli-progress": "^3.12.0",
+    "inquirer": "^9.2.0",
+    "log-update": "^6.0.0",
+    "robots-parser": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
