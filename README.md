@@ -2,7 +2,7 @@
 
 A fast, opinionated CLI website auditor built with Node.js. Crawl any site, extract SEO metadata, detect broken links, check security headers, and generate a beautiful HTML report — all from a single command.
 
-![HTML Report](https://raw.githubusercontent.com/ssjohl/webaudit/report-screenshot.png)
+![HTML Report](https://raw.githubusercontent.com/ssjohl/webaudit/master/screenshot.png)
 
 ## Features
 
