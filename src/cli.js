@@ -10,6 +10,9 @@ import { saveState, findResumableScan, generateScanId, markCompleted } from './s
 import { crawl } from './crawler.js';
 import { Dashboard } from './dashboard.js';
 import { writeResults, printSummary } from './results.js';
+import { analyzeSEO } from './seo-analyzer.js';
+import { fetchSitemap, compareSitemap } from './sitemap.js';
+import { generateReport } from './report.js';
 
 /**
  * Main entry point.
@@ -48,6 +51,7 @@ export async function run(args) {
 
     const domain = domains[0];
     const startPaths = startUrls.map((u) => parseDomainAndPath(u).path);
+    const scheme = new URL(startUrls[0]).protocol.replace(':', '');
 
     console.log(`\n  🌐  Domain: ${domain}`);
     console.log(`  📂  Paths:  ${startPaths.join(', ')}\n`);
@@ -89,17 +93,21 @@ export async function run(args) {
         scanId = generateScanId();
     }
 
-    // Fetch robots.txt (use same scheme as first start URL)
-    const scheme = new URL(startUrls[0]).protocol.replace(':', '');
+    // Fetch robots.txt
     console.log('  🤖  Fetching robots.txt...');
     const robots = await loadRobotsTxt(domain, scheme);
-    console.log('  ✅  robots.txt loaded.\n');
+    console.log('  ✅  robots.txt loaded.');
+
+    // Fetch sitemap
+    console.log('  🗺️   Fetching sitemap.xml...');
+    const sitemapUrls = await fetchSitemap(domain, scheme);
+    console.log(`  ✅  Sitemap: ${sitemapUrls.length} URLs found.\n`);
 
     // Set up dashboard
     const dashboard = new Dashboard();
     dashboard.start(domain, startPaths[0]);
 
-    // Set up SIGINT handler for graceful shutdown
+    // SIGINT handler
     let interrupted = false;
     const sigintHandler = async () => {
         if (interrupted) {
@@ -136,23 +144,45 @@ export async function run(args) {
 
         dashboard.stop();
 
+        // Post-crawl analysis
+        console.log('\n  🔍  Running SEO analysis...');
+        const seoAnalysis = analyzeSEO(results);
+
+        let sitemapComparison = null;
+        if (sitemapUrls.length > 0) {
+            console.log('  🗺️   Comparing with sitemap...');
+            sitemapComparison = compareSitemap(sitemapUrls, results);
+        }
+
         // Save state as completed
         await markCompleted(domain, scanId);
 
-        // Write results
-        const resultsDir = await writeResults(domain, scanId, results, startUrls);
-        printSummary(results, resultsDir);
+        // Write results (JSON, CSV, reports)
+        const extras = { seoAnalysis, sitemapComparison };
+        const resultsDir = await writeResults(domain, scanId, results, startUrls, extras);
+
+        // Generate HTML report
+        console.log('  📊  Generating HTML report...');
+        const reportPath = await generateReport(resultsDir, {
+            pages: results,
+            seoAnalysis,
+            sitemapComparison,
+            domain,
+            scanId,
+        });
+        console.log(`  ✅  Report: ${reportPath}`);
+
+        printSummary(results, resultsDir, extras);
     } catch (err) {
         dashboard.stop();
         console.error(`\n  ❌  Crawl failed: ${err.message}\n`);
 
-        // Try to save partial state
         try {
             const state = crawl.getState?.() || { status: 'in-progress', results: {} };
             await saveState(domain, scanId, state);
             console.log('  💾  Partial state saved. You can resume later.\n');
         } catch {
-            // State save failed too — nothing more we can do
+            // State save failed
         }
 
         process.exit(1);
@@ -164,7 +194,6 @@ export async function run(args) {
 
 /**
  * Prompt user for configuration.
- * If config already exists, show current values as defaults.
  */
 async function promptConfig(existingConfig, isExisting) {
     const defaults = { ...getDefaultConfig(), ...(existingConfig || {}) };
@@ -189,6 +218,13 @@ async function promptConfig(existingConfig, isExisting) {
             name: 'maxDepth',
             message: 'Maximum crawl depth:',
             default: defaults.maxDepth,
+            validate: (v) => (v > 0 ? true : 'Must be > 0'),
+        },
+        {
+            type: 'number',
+            name: 'maxRedirects',
+            message: 'Maximum redirect hops:',
+            default: defaults.maxRedirects,
             validate: (v) => (v > 0 ? true : 'Must be > 0'),
         },
         {
@@ -219,6 +255,18 @@ async function promptConfig(existingConfig, isExisting) {
                     .split(',')
                     .map((s) => s.trim())
                     .filter((s) => s.length > 0),
+        },
+        {
+            type: 'input',
+            name: 'cookies',
+            message: 'Cookies (key=value; key2=value2):',
+            default: defaults.cookies || '',
+        },
+        {
+            type: 'input',
+            name: 'basicAuth',
+            message: 'Basic auth (user:password, leave empty for none):',
+            default: defaults.basicAuth || '',
         },
     ]);
 

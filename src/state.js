@@ -1,6 +1,6 @@
 /**
  * Scan state persistence for resume support.
- * State files: ~/.webaudit/projects/<domain>/scans/<scanId>/state.json
+ * State files: ./output/<domain>/scans/<scanId>/state.json
  */
 
 import { readFile, writeFile, mkdir, readdir, rename } from 'node:fs/promises';

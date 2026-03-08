@@ -1,17 +1,18 @@
 /**
- * HTML parser — extracts SEO metadata and links from a page.
+ * HTML parser — extracts SEO metadata, links, and mixed content from a page.
  */
 
 import * as cheerio from 'cheerio';
 
 /**
- * Parse an HTML body and extract metadata + links.
+ * Parse an HTML body and extract metadata + links + mixed content.
  * @param {string} html - The HTML content
  * @param {string} pageUrl - The URL of the page (for resolving relative links)
  * @returns {{ metadata, links }}
  */
 export function parsePage(html, pageUrl) {
     const $ = cheerio.load(html);
+    const isHttps = pageUrl.startsWith('https://');
 
     const metadata = {
         title: $('title').first().text().trim() || null,
@@ -35,6 +36,7 @@ export function parsePage(html, pageUrl) {
             .map((_, el) => $(el).attr('src'))
             .get()
             .filter(Boolean),
+        mixedContent: isHttps ? detectMixedContent($, pageUrl) : [],
     };
 
     const links = extractLinks($, pageUrl);
@@ -78,7 +80,6 @@ function extractImages($) {
  */
 function extractLinks($, pageUrl) {
     const links = [];
-    const baseUrl = pageUrl;
 
     $('a[href]').each((_, el) => {
         const href = $(el).attr('href')?.trim();
@@ -89,9 +90,9 @@ function extractLinks($, pageUrl) {
 
         let resolved;
         try {
-            resolved = new URL(href, baseUrl).toString();
+            resolved = new URL(href, pageUrl).toString();
         } catch {
-            return; // Invalid URL
+            return;
         }
 
         links.push({
@@ -103,4 +104,43 @@ function extractLinks($, pageUrl) {
     });
 
     return links;
+}
+
+/**
+ * Detect mixed content on HTTPS pages.
+ * Checks img, script, link[stylesheet], iframe, video, audio, source, embed, object.
+ */
+function detectMixedContent($, pageUrl) {
+    const mixed = [];
+
+    const selectors = [
+        { sel: 'img[src]', attr: 'src', type: 'image' },
+        { sel: 'script[src]', attr: 'src', type: 'script' },
+        { sel: 'link[rel="stylesheet"][href]', attr: 'href', type: 'stylesheet' },
+        { sel: 'iframe[src]', attr: 'src', type: 'iframe' },
+        { sel: 'video[src]', attr: 'src', type: 'video' },
+        { sel: 'audio[src]', attr: 'src', type: 'audio' },
+        { sel: 'source[src]', attr: 'src', type: 'media-source' },
+        { sel: 'embed[src]', attr: 'src', type: 'embed' },
+        { sel: 'object[data]', attr: 'data', type: 'object' },
+    ];
+
+    for (const { sel, attr, type } of selectors) {
+        $(sel).each((_, el) => {
+            const url = $(el).attr(attr);
+            if (url && url.startsWith('http://')) {
+                mixed.push({ type, url });
+            } else if (url && !url.startsWith('https://') && !url.startsWith('//') && !url.startsWith('/') && !url.startsWith('data:')) {
+                // Resolve relative URLs to check
+                try {
+                    const resolved = new URL(url, pageUrl);
+                    if (resolved.protocol === 'http:') {
+                        mixed.push({ type, url: resolved.toString() });
+                    }
+                } catch { /* ignore */ }
+            }
+        });
+    }
+
+    return mixed;
 }

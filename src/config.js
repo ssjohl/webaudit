@@ -1,19 +1,23 @@
 /**
  * Project configuration management.
- * Stores per-domain settings in ~/.webaudit/projects/<domain>/config.json
+ * Stores per-domain settings in ./output/<domain>/config.json
  */
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 
-const BASE_DIR = join(homedir(), '.webaudit', 'projects');
+/**
+ * Get the base output directory (CWD-relative).
+ */
+export function getOutputDir() {
+    return resolve(process.cwd(), 'output');
+}
 
 /**
  * Get the directory path for a domain's project.
  */
 export function getProjectDir(domain) {
-    return join(BASE_DIR, domain);
+    return join(getOutputDir(), domain);
 }
 
 /**
@@ -65,8 +69,11 @@ export function getDefaultConfig() {
         concurrency: 5,
         rateLimit: 200,
         maxDepth: 10,
+        maxRedirects: 10,
         timeout: 30000,
         ignorableParams: [],
         blockedDomains: [],
+        cookies: '',
+        basicAuth: '',
     };
 }

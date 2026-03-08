@@ -7,6 +7,7 @@ import { fetchPage, fetchHead } from './fetcher.js';
 import { parsePage } from './parser.js';
 import { normaliseUrl, isInScope, isSameDomain } from './url-utils.js';
 import { isDisallowed } from './robots.js';
+import { checkSecurityHeaders } from './security-checker.js';
 
 /**
  * Run a crawl.
@@ -15,7 +16,7 @@ import { isDisallowed } from './robots.js';
  * @param {string[]} options.startUrls - URLs to begin crawling from
  * @param {string} options.domain - The domain being crawled
  * @param {string[]} options.startPaths - The in-scope paths (one per start URL)
- * @param {Object} options.config - Project config (concurrency, rateLimit, maxDepth, etc.)
+ * @param {Object} options.config - Project config
  * @param {Object} options.robots - Parsed robots.txt
  * @param {Dashboard} options.dashboard - CLI dashboard instance
  * @param {Object} [options.resumeState] - Previous scan state to resume from
@@ -34,12 +35,16 @@ export async function crawl({
         concurrency = 5,
         rateLimit = 200,
         maxDepth = 10,
+        maxRedirects = 10,
         ignorableParams = [],
         blockedDomains = [],
         timeout = 30000,
+        cookies = '',
+        basicAuth = '',
     } = config;
 
     const blockedSet = new Set(blockedDomains.map((d) => d.toLowerCase()));
+    const fetchOptions = { timeout, maxRedirects, cookies, basicAuth };
 
     // State
     const visited = new Set(resumeState?.visited || []);
@@ -62,12 +67,10 @@ export async function crawl({
     ).length;
     let errorCount = Object.values(results).filter((r) => r.error).length;
 
-    // Active worker count (for the semaphore)
-    let activeWorkers = 0;
     let lastRequestTime = 0;
+    let activeWorkers = 0;
     let stopped = false;
 
-    // State snapshot callback (set by caller for SIGINT handling)
     const getState = () => ({
         status: 'in-progress',
         startUrls,
@@ -76,7 +79,6 @@ export async function crawl({
         results,
     });
 
-    // Expose getState for the CLI to call on SIGINT
     crawl.getState = getState;
 
     function updateDashboard(currentUrl = '') {
@@ -91,9 +93,6 @@ export async function crawl({
         });
     }
 
-    /**
-     * Rate-limited delay before each request.
-     */
     async function rateLimitWait() {
         const now = Date.now();
         const elapsed = now - lastRequestTime;
@@ -103,9 +102,6 @@ export async function crawl({
         lastRequestTime = Date.now();
     }
 
-    /**
-     * Process a single URL from the queue.
-     */
     async function processUrl(item) {
         const { url, depth, from } = item;
         const normUrl = normaliseUrl(url, ignorableParams);
@@ -121,43 +117,41 @@ export async function crawl({
         const robotsBlocked = robots ? isDisallowed(robots, url) : false;
 
         if (internal && inScope) {
-            // Full crawl of internal, in-scope pages
             if (depth > maxDepth) {
-                results[normUrl] = {
-                    url,
-                    normalizedUrl: normUrl,
-                    status: null,
-                    mimeType: null,
-                    loadTimeMs: 0,
+                results[normUrl] = createResult(url, normUrl, {
                     robotsDisallowed: robotsBlocked,
                     depth,
                     type: 'internal',
-                    metadata: null,
-                    links: { internal: [], external: [] },
                     linkedFrom: from ? [from] : [],
                     error: 'Max depth exceeded',
-                };
+                });
                 errorCount++;
                 updateDashboard();
                 return;
             }
 
-            const result = await fetchPage(url, { timeout });
+            const result = await fetchPage(url, fetchOptions);
 
-            const pageResult = {
-                url,
-                normalizedUrl: normUrl,
+            const pageResult = createResult(url, normUrl, {
                 status: result.status,
+                finalUrl: result.finalUrl,
                 mimeType: result.mimeType,
                 loadTimeMs: result.loadTimeMs,
+                contentLength: result.contentLength,
                 robotsDisallowed: robotsBlocked,
                 depth,
                 type: 'internal',
-                metadata: null,
-                links: { internal: [], external: [] },
                 linkedFrom: from ? [from] : [],
                 error: result.error,
-            };
+                redirectChain: result.redirectChain,
+                redirectLoop: result.redirectLoop,
+                headers: result.headers,
+            });
+
+            // Security headers check
+            if (result.headers) {
+                pageResult.security = checkSecurityHeaders(result.headers);
+            }
 
             internalCount++;
             if (result.status >= 400 || result.status === 0) brokenCount++;
@@ -165,7 +159,7 @@ export async function crawl({
 
             // Parse HTML content
             if (result.body && result.mimeType?.includes('html')) {
-                const { metadata, links } = parsePage(result.body, url);
+                const { metadata, links } = parsePage(result.body, result.finalUrl || url);
                 pageResult.metadata = metadata;
 
                 for (const link of links) {
@@ -179,7 +173,6 @@ export async function crawl({
                             text: link.text,
                         });
 
-                        // Add to queue if in scope and not visited
                         const linkInScope = startPaths.some((sp) => isInScope(link.resolved, sp));
                         if (linkInScope && !visited.has(resolvedNorm)) {
                             queue.push({
@@ -195,7 +188,6 @@ export async function crawl({
                             text: link.text,
                         });
 
-                        // Check external links (HEAD only) if not blocked and not already checked
                         const extDomain = new URL(link.resolved).hostname.toLowerCase();
                         if (!blockedSet.has(extDomain) && !visited.has(resolvedNorm)) {
                             queue.push({
@@ -211,46 +203,37 @@ export async function crawl({
 
             results[normUrl] = pageResult;
         } else if (internal && !inScope) {
-            // Internal but out of scope — record but don't crawl
             if (!results[normUrl]) {
-                results[normUrl] = {
-                    url,
-                    normalizedUrl: normUrl,
-                    status: null,
-                    mimeType: null,
-                    loadTimeMs: 0,
+                results[normUrl] = createResult(url, normUrl, {
                     robotsDisallowed: robotsBlocked,
                     depth,
                     type: 'internal',
-                    metadata: null,
-                    links: { internal: [], external: [] },
                     linkedFrom: from ? [from] : [],
                     error: 'Out of scope — not crawled',
-                };
+                });
                 internalCount++;
             } else if (from) {
                 results[normUrl].linkedFrom.push(from);
             }
         } else {
-            // External link — HEAD check only
+            // External link
             const extDomain = new URL(url).hostname.toLowerCase();
             if (blockedSet.has(extDomain)) return;
 
-            const result = await fetchHead(url, { timeout });
-            results[normUrl] = {
-                url,
-                normalizedUrl: normUrl,
+            const result = await fetchHead(url, fetchOptions);
+            results[normUrl] = createResult(url, normUrl, {
                 status: result.status,
+                finalUrl: result.finalUrl,
                 mimeType: result.mimeType,
                 loadTimeMs: result.loadTimeMs,
-                robotsDisallowed: false,
+                contentLength: result.contentLength,
                 depth,
                 type: 'external',
-                metadata: null,
-                links: { internal: [], external: [] },
                 linkedFrom: from ? [from] : [],
                 error: result.error,
-            };
+                redirectChain: result.redirectChain,
+                redirectLoop: result.redirectLoop,
+            });
 
             externalCount++;
             if (result.status >= 400 || result.status === 0) brokenCount++;
@@ -260,9 +243,6 @@ export async function crawl({
         updateDashboard();
     }
 
-    /**
-     * Worker loop: pull items from the queue until empty.
-     */
     async function worker() {
         while (queue.length > 0 && !stopped) {
             const item = queue.shift();
@@ -271,7 +251,6 @@ export async function crawl({
             const normUrl = normaliseUrl(item.url, ignorableParams);
             if (visited.has(normUrl)) continue;
 
-            // Track linkedFrom for already-visited pages
             if (results[normUrl] && item.from) {
                 if (!results[normUrl].linkedFrom.includes(item.from)) {
                     results[normUrl].linkedFrom.push(item.from);
@@ -283,13 +262,8 @@ export async function crawl({
         }
     }
 
-    /**
-     * Run concurrent workers until the queue is exhausted.
-     */
     async function runWorkers() {
-        // Keep spawning workers as long as queue has items
         while (queue.length > 0 && !stopped) {
-            // Fill up to concurrency limit
             const promises = [];
             while (activeWorkers < concurrency && queue.length > 0 && !stopped) {
                 activeWorkers++;
@@ -304,18 +278,42 @@ export async function crawl({
                 await Promise.all(promises);
             }
 
-            // Small pause to allow new items to be discovered
             if (queue.length > 0 && !stopped) {
                 await new Promise((resolve) => setTimeout(resolve, 50));
             }
         }
     }
 
-    // Expose stop function
     crawl.stop = () => {
         stopped = true;
     };
 
     await runWorkers();
     return results;
+}
+
+/**
+ * Create a standardised page result object.
+ */
+function createResult(url, normUrl, overrides = {}) {
+    return {
+        url,
+        normalizedUrl: normUrl,
+        status: null,
+        finalUrl: url,
+        mimeType: null,
+        loadTimeMs: 0,
+        contentLength: 0,
+        robotsDisallowed: false,
+        depth: 0,
+        type: 'internal',
+        metadata: null,
+        links: { internal: [], external: [] },
+        linkedFrom: [],
+        error: null,
+        redirectChain: [],
+        redirectLoop: false,
+        security: null,
+        ...overrides,
+    };
 }
